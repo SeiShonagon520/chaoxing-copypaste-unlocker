@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通复制粘贴解除 - MAIN环境诊断版
 // @namespace    chaoxing-mainworld-debug
-// @version      4.0.0
+// @version      4.1.0
 // @license      MIT
 // @description  针对学习通 mooc2-ans 作答页面，模拟 Console 环境解除复制粘贴限制
 // @author       SeiShonagon520
@@ -426,22 +426,42 @@
                     /*
                      * 事件列表
                      *
-                     * 完全按照用户已经验证有效的
-                     * Console 代码。
+                     * 分两类处理：
+                     *
+                     * GUARDED（守卫）：
+                     *   页面拦截这些事件没有正当理由，
+                     *   可以直接截断传播。
+                     *
+                     * PASSIVE（放行）：
+                     *   这些事件和页面交互强相关（输入、点击、按键）。
+                     *   早期版本对所有事件统一 stopPropagation，
+                     *   会让编辑器/输入框自身的处理器收不到事件，
+                     *   表现为「输入框不能输入、粘贴无反应」。
+                     *   这里只让 preventDefault / returnValue 失效，
+                     *   事件照常冒泡。
                      */
 
-                    const EVENTS = [
-                        'paste',
+                    const GUARDED_EVENTS = [
                         'copy',
                         'cut',
                         'contextmenu',
+                        'selectstart',
+                        'dragstart'
+                    ];
+
+                    const PASSIVE_EVENTS = [
+                        'paste',
+                        'beforepaste',
                         'keydown',
                         'keyup',
                         'keypress',
-                        'selectstart',
-                        'dragstart',
-                        'mousedown'
+                        'mousedown',
+                        'mouseup'
                     ];
+
+                    const EVENTS = GUARDED_EVENTS.concat(
+                        PASSIVE_EVENTS
+                    );
 
 
                     /*
@@ -461,102 +481,154 @@
 
 
                     /*
-                     * 注册事件
+                     * 让事件对象上的取消动作失效。
+                     *
+                     * 页面常用 preventDefault() 或 returnValue = false
+                     * 取消复制/粘贴的默认行为。
+                     * 只改事件实例，不动原型，避免影响页面其他逻辑。
                      */
 
-                    EVENTS.forEach(
-                        type => {
+                    function neutralizeEvent(e) {
 
-                            document.addEventListener(
-                                type,
-                                function (e) {
+                        try {
 
-                                    counter[type]++;
+                            if (e.__cxNeutralized) {
+                                return;
+                            }
 
-
-                                    /*
-                                     * paste / copy / cut
-                                     * 以及 Ctrl+C/V/X
-                                     * 重点打印。
-                                     */
-
-                                    const important =
-                                        type === 'paste' ||
-                                        type === 'copy' ||
-                                        type === 'cut' ||
-                                        (
-                                            type === 'keydown' &&
-                                            (
-                                                e.ctrlKey ||
-                                                e.metaKey
-                                            ) &&
-                                            (
-                                                String(
-                                                    e.key
-                                                ).toLowerCase() === 'v' ||
-                                                String(
-                                                    e.key
-                                                ).toLowerCase() === 'c' ||
-                                                String(
-                                                    e.key
-                                                ).toLowerCase() === 'x'
-                                            )
-                                        );
-
-
-                                    if (important) {
-
-                                        console.log(
-                                            '%c[粘贴助手][PAGE][EVENT]',
-                                            'color:#e91e63;font-weight:bold;',
-                                            {
-                                                type,
-                                                key: e.key,
-                                                code: e.code,
-                                                target:
-                                                    e.target?.tagName,
-                                                targetId:
-                                                    e.target?.id,
-                                                ctrlKey:
-                                                    e.ctrlKey,
-                                                metaKey:
-                                                    e.metaKey,
-                                                shiftKey:
-                                                    e.shiftKey,
-                                                altKey:
-                                                    e.altKey,
-                                                defaultPrevented:
-                                                    e.defaultPrevented,
-                                                phase:
-                                                    e.eventPhase,
-                                                pasteCounter:
-                                                    counter.paste
-                                            }
-                                        );
-
-                                    }
-
-
-                                    /*
-                                     * 核心：
-                                     *
-                                     * 这就是你在 Console
-                                     * 中验证有效的代码。
-                                     */
-
-                                    e.stopPropagation();
-
-                                },
-                                true
+                            Object.defineProperty(
+                                e,
+                                '__cxNeutralized',
+                                {
+                                    configurable: true,
+                                    value: true
+                                }
                             );
 
+                            Object.defineProperty(
+                                e,
+                                'preventDefault',
+                                {
+                                    configurable: true,
+                                    value: function () {}
+                                }
+                            );
 
-                            console.log(
-                                '[粘贴助手][PAGE] 已注册:',
-                                type
+                            Object.defineProperty(
+                                e,
+                                'returnValue',
+                                {
+                                    configurable: true,
+                                    get: () => true,
+                                    set: () => {}
+                                }
+                            );
+
+                            Object.defineProperty(
+                                e,
+                                'defaultPrevented',
+                                {
+                                    configurable: true,
+                                    get: () => false
+                                }
+                            );
+
+                        } catch (err) {}
+
+                    }
+
+
+                    /*
+                     * 注册事件
+                     *
+                     * 必须同时注册在 window 和 document 上，都走捕获阶段。
+                     *
+                     * window 捕获早于 document 捕获：
+                     * 页面常在 document 捕获阶段拦截，
+                     * 只注册 document 会被它抢先，
+                     * 我们的守卫来不及执行。
+                     */
+
+                    const eventTargets = [window, document];
+
+                    GUARDED_EVENTS.forEach(
+                        type => {
+
+                            eventTargets.forEach(
+                                target => {
+
+                                    target.addEventListener(
+                                        type,
+                                        function (e) {
+
+                                            counter[type]++;
+
+                                            neutralizeEvent(e);
+
+                                            /*
+                                             * 这一类事件页面拦截没有正当性，
+                                             * 直接截断，页面处理器收不到。
+                                             * 浏览器默认的复制/右键菜单不受影响。
+                                             */
+
+                                            try {
+                                                e.stopImmediatePropagation();
+                                            } catch (err) {}
+
+                                            try {
+                                                e.stopPropagation();
+                                            } catch (err) {}
+
+                                        },
+                                        true
+                                    );
+
+                                }
                             );
 
                         }
+                    );
+
+
+                    PASSIVE_EVENTS.forEach(
+                        type => {
+
+                            eventTargets.forEach(
+                                target => {
+
+                                    target.addEventListener(
+                                        type,
+                                        function (e) {
+
+                                            counter[type]++;
+
+                                            /*
+                                             * 只解除取消动作，不阻断传播，
+                                             * 页面自身的输入处理、
+                                             * 编辑器逻辑、快捷键响应仍然正常。
+                                             */
+
+                                            neutralizeEvent(e);
+
+                                        },
+                                        true
+                                    );
+
+                                }
+                            );
+
+                        }
+                    );
+
+
+                    console.log(
+                        '[粘贴助手][PAGE] 已注册守卫事件:',
+                        GUARDED_EVENTS.join(',')
+                    );
+
+                    console.log(
+                        '[粘贴助手][PAGE] 已注册放行事件:',
+                        PASSIVE_EVENTS.join(',')
                     );
 
 
