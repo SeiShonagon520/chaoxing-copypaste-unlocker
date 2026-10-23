@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通复制粘贴解除 - MAIN环境诊断版
 // @namespace    chaoxing-mainworld-debug
-// @version      4.0.0
+// @version      4.1.0
 // @license      MIT
 // @description  针对学习通 mooc2-ans 作答页面，模拟 Console 环境解除复制粘贴限制
 // @author       SeiShonagon520
@@ -426,22 +426,42 @@
                     /*
                      * 事件列表
                      *
-                     * 完全按照用户已经验证有效的
-                     * Console 代码。
+                     * 分两类处理：
+                     *
+                     * GUARDED（守卫）：
+                     *   页面拦截这些事件没有正当理由，
+                     *   可以直接截断传播。
+                     *
+                     * PASSIVE（放行）：
+                     *   这些事件和页面交互强相关（输入、点击、按键）。
+                     *   早期版本对所有事件统一 stopPropagation，
+                     *   会让编辑器/输入框自身的处理器收不到事件，
+                     *   表现为「输入框不能输入、粘贴无反应」。
+                     *   这里只让 preventDefault / returnValue 失效，
+                     *   事件照常冒泡。
                      */
 
-                    const EVENTS = [
-                        'paste',
+                    const GUARDED_EVENTS = [
                         'copy',
                         'cut',
                         'contextmenu',
+                        'selectstart',
+                        'dragstart'
+                    ];
+
+                    const PASSIVE_EVENTS = [
+                        'paste',
+                        'beforepaste',
                         'keydown',
                         'keyup',
                         'keypress',
-                        'selectstart',
-                        'dragstart',
-                        'mousedown'
+                        'mousedown',
+                        'mouseup'
                     ];
+
+                    const EVENTS = GUARDED_EVENTS.concat(
+                        PASSIVE_EVENTS
+                    );
 
 
                     /*
@@ -461,103 +481,1004 @@
 
 
                     /*
-                     * 注册事件
+                     * 让事件对象上的取消动作失效。
+                     *
+                     * 页面常用 preventDefault() 或 returnValue = false
+                     * 取消复制/粘贴的默认行为。
+                     * 只改事件实例，不动原型，避免影响页面其他逻辑。
                      */
 
-                    EVENTS.forEach(
-                        type => {
+                    function neutralizeEvent(e) {
 
-                            document.addEventListener(
-                                type,
-                                function (e) {
+                        try {
 
-                                    counter[type]++;
+                            if (e.__cxNeutralized) {
+                                return;
+                            }
 
-
-                                    /*
-                                     * paste / copy / cut
-                                     * 以及 Ctrl+C/V/X
-                                     * 重点打印。
-                                     */
-
-                                    const important =
-                                        type === 'paste' ||
-                                        type === 'copy' ||
-                                        type === 'cut' ||
-                                        (
-                                            type === 'keydown' &&
-                                            (
-                                                e.ctrlKey ||
-                                                e.metaKey
-                                            ) &&
-                                            (
-                                                String(
-                                                    e.key
-                                                ).toLowerCase() === 'v' ||
-                                                String(
-                                                    e.key
-                                                ).toLowerCase() === 'c' ||
-                                                String(
-                                                    e.key
-                                                ).toLowerCase() === 'x'
-                                            )
-                                        );
-
-
-                                    if (important) {
-
-                                        console.log(
-                                            '%c[粘贴助手][PAGE][EVENT]',
-                                            'color:#e91e63;font-weight:bold;',
-                                            {
-                                                type,
-                                                key: e.key,
-                                                code: e.code,
-                                                target:
-                                                    e.target?.tagName,
-                                                targetId:
-                                                    e.target?.id,
-                                                ctrlKey:
-                                                    e.ctrlKey,
-                                                metaKey:
-                                                    e.metaKey,
-                                                shiftKey:
-                                                    e.shiftKey,
-                                                altKey:
-                                                    e.altKey,
-                                                defaultPrevented:
-                                                    e.defaultPrevented,
-                                                phase:
-                                                    e.eventPhase,
-                                                pasteCounter:
-                                                    counter.paste
-                                            }
-                                        );
-
-                                    }
-
-
-                                    /*
-                                     * 核心：
-                                     *
-                                     * 这就是你在 Console
-                                     * 中验证有效的代码。
-                                     */
-
-                                    e.stopPropagation();
-
-                                },
-                                true
+                            Object.defineProperty(
+                                e,
+                                '__cxNeutralized',
+                                {
+                                    configurable: true,
+                                    value: true
+                                }
                             );
 
+                            Object.defineProperty(
+                                e,
+                                'preventDefault',
+                                {
+                                    configurable: true,
+                                    value: function () {}
+                                }
+                            );
 
-                            console.log(
-                                '[粘贴助手][PAGE] 已注册:',
-                                type
+                            Object.defineProperty(
+                                e,
+                                'returnValue',
+                                {
+                                    configurable: true,
+                                    get: () => true,
+                                    set: () => {}
+                                }
+                            );
+
+                            Object.defineProperty(
+                                e,
+                                'defaultPrevented',
+                                {
+                                    configurable: true,
+                                    get: () => false
+                                }
+                            );
+
+                        } catch (err) {}
+
+                    }
+
+
+                    /*
+                     * 注册事件
+                     *
+                     * 必须同时注册在 window 和 document 上，都走捕获阶段。
+                     *
+                     * window 捕获早于 document 捕获：
+                     * 页面常在 document 捕获阶段拦截，
+                     * 只注册 document 会被它抢先，
+                     * 我们的守卫来不及执行。
+                     */
+
+                    const eventTargets = [window, document];
+
+                    GUARDED_EVENTS.forEach(
+                        type => {
+
+                            eventTargets.forEach(
+                                target => {
+
+                                    target.addEventListener(
+                                        type,
+                                        function (e) {
+
+                                            counter[type]++;
+
+                                            neutralizeEvent(e);
+
+                                            /*
+                                             * 这一类事件页面拦截没有正当性，
+                                             * 直接截断，页面处理器收不到。
+                                             * 浏览器默认的复制/右键菜单不受影响。
+                                             */
+
+                                            try {
+                                                e.stopImmediatePropagation();
+                                            } catch (err) {}
+
+                                            try {
+                                                e.stopPropagation();
+                                            } catch (err) {}
+
+                                        },
+                                        true
+                                    );
+
+                                }
                             );
 
                         }
                     );
+
+
+                    PASSIVE_EVENTS.forEach(
+                        type => {
+
+                            eventTargets.forEach(
+                                target => {
+
+                                    target.addEventListener(
+                                        type,
+                                        function (e) {
+
+                                            counter[type]++;
+
+                                            /*
+                                             * 只解除取消动作，不阻断传播，
+                                             * 页面自身的输入处理、
+                                             * 编辑器逻辑、快捷键响应仍然正常。
+                                             */
+
+                                            neutralizeEvent(e);
+
+                                        },
+                                        true
+                                    );
+
+                                }
+                            );
+
+                        }
+                    );
+
+
+                    console.log(
+                        '[粘贴助手][PAGE] 已注册守卫事件:',
+                        GUARDED_EVENTS.join(',')
+                    );
+
+                    console.log(
+                        '[粘贴助手][PAGE] 已注册放行事件:',
+                        PASSIVE_EVENTS.join(',')
+                    );
+
+                    /*
+                     * 强制文本可选中。
+                     *
+                     * 页面常用 user-select:none 让鼠标拖选失效。
+                     * 实测学习通把这条样式挂在 <html> 的内联 style 上，
+                     * 而不是正文容器的 class，所以必须
+                     * 覆盖到 html/body 及其后代，并且带 !important。
+                     */
+
+                    const SELECT_STYLE_ID =
+                        '__cx_paste_select_style__';
+
+                    function injectSelectStyle() {
+
+                        try {
+
+                            if (
+                                document.getElementById(
+                                    SELECT_STYLE_ID
+                                )
+                            ) {
+                                return true;
+                            }
+
+                            const style =
+                                document.createElement('style');
+
+                            style.id = SELECT_STYLE_ID;
+
+                            style.textContent = `
+html, body, body *:not(#__cx_paste_debug_panel__):not(#__cx_paste_debug_panel__ *) {
+    -webkit-user-select: text !important;
+    -moz-user-select: text !important;
+    -ms-user-select: text !important;
+    -khtml-user-select: text !important;
+    user-select: text !important;
+    -webkit-touch-callout: default !important;
+    -webkit-user-drag: auto !important;
+}
+::selection {
+    background: #ffe58f !important;
+    color: #111 !important;
+}
+`;
+
+                            /*
+                             * document-start 时 head 与 documentElement
+                             * 都可能不存在，必须重试，
+                             * 否则样式永远注入不进去。
+                             */
+
+                            const root =
+                                document.head ||
+                                document.documentElement;
+
+                            if (!root) {
+
+                                setTimeout(injectSelectStyle, 10);
+
+                                return false;
+
+                            }
+
+                            root.appendChild(style);
+
+                            return true;
+
+                        } catch (err) {
+
+                            setTimeout(injectSelectStyle, 50);
+
+                            return false;
+
+                        }
+                    }
+
+
+                    /*
+                     * 还原被页面替换掉的选区 API。
+                     *
+                     * 页面可能把 getSelection 或 Selection.toString
+                     * 换成返回空字符串，导致「能选中但复制为空」。
+                     *
+                     * 脚本运行在 document-idle，此时页面可能已经
+                     * 完成替换，直接取当前值会拿到被替换后的版本。
+                     * 因此这里做原生性校验，拿不到原生实现时
+                     * 用一个同源空白 iframe 取干净的那份。
+                     */
+
+                    function looksNative(fn) {
+
+                        try {
+
+                            return (
+                                typeof fn === 'function' &&
+                                /\{\s*\[native code\]\s*\}/
+                                    .test(
+                                        Function.prototype
+                                            .toString
+                                            .call(fn)
+                                    )
+                            );
+
+                        } catch (err) {
+
+                            return false;
+
+                        }
+                    }
+
+
+                    function getPristineSelectionApi() {
+
+                        try {
+
+                            const iframe =
+                                document.createElement('iframe');
+
+                            iframe.style.cssText =
+                                'display:none;width:0;height:0;border:0';
+
+                            (document.body ||
+                                document.documentElement)
+                                .appendChild(iframe);
+
+                            const win = iframe.contentWindow;
+                            const doc = win.document;
+
+                            const api = {
+                                getSelection: win.getSelection,
+                                docGetSelection: doc.getSelection,
+                                selectionToString:
+                                    win.Selection.prototype.toString,
+                                execCommand: doc.execCommand
+                            };
+
+                            iframe.remove();
+
+                            return api;
+
+                        } catch (err) {
+
+                            return null;
+
+                        }
+                    }
+
+
+                    const pristineApi =
+                        getPristineSelectionApi() || {};
+
+                    const native = {
+                        getSelection:
+                            looksNative(window.getSelection)
+                                ? window.getSelection
+                                : (
+                                    pristineApi.getSelection ||
+                                    window.getSelection
+                                ),
+                        docGetSelection:
+                            looksNative(
+                                window.Document.prototype
+                                    .getSelection
+                            )
+                                ? window.Document.prototype
+                                    .getSelection
+                                : (
+                                    pristineApi.docGetSelection ||
+                                    window.Document.prototype
+                                        .getSelection
+                                ),
+                        selectionToString:
+                            looksNative(
+                                window.Selection.prototype.toString
+                            )
+                                ? window.Selection.prototype.toString
+                                : (
+                                    pristineApi.selectionToString ||
+                                    window.Selection.prototype
+                                        .toString
+                                ),
+                        execCommand:
+                            looksNative(
+                                window.Document.prototype
+                                    .execCommand
+                            )
+                                ? window.Document.prototype
+                                    .execCommand
+                                : (
+                                    pristineApi.execCommand ||
+                                    window.Document.prototype
+                                        .execCommand
+                                )
+                    };
+
+
+                    let restoredApiCount = 0;
+
+                    function restoreSelectionApi() {
+
+                        try {
+
+                            if (
+                                !looksNative(window.getSelection) &&
+                                looksNative(native.getSelection)
+                            ) {
+
+                                Object.defineProperty(
+                                    window,
+                                    'getSelection',
+                                    {
+                                        configurable: true,
+                                        writable: true,
+                                        value: native.getSelection
+                                    }
+                                );
+
+                                restoredApiCount++;
+                            }
+
+                        } catch (err) {}
+
+                        try {
+
+                            if (
+                                !looksNative(
+                                    window.Document.prototype
+                                        .getSelection
+                                ) &&
+                                looksNative(native.docGetSelection)
+                            ) {
+
+                                Object.defineProperty(
+                                    window.Document.prototype,
+                                    'getSelection',
+                                    {
+                                        configurable: true,
+                                        writable: true,
+                                        value: native.docGetSelection
+                                    }
+                                );
+
+                                restoredApiCount++;
+                            }
+
+                        } catch (err) {}
+
+                        try {
+
+                            if (
+                                !looksNative(
+                                    window.Selection.prototype
+                                        .toString
+                                ) &&
+                                looksNative(
+                                    native.selectionToString
+                                )
+                            ) {
+
+                                Object.defineProperty(
+                                    window.Selection.prototype,
+                                    'toString',
+                                    {
+                                        configurable: true,
+                                        writable: true,
+                                        value:
+                                            native.selectionToString
+                                    }
+                                );
+
+                                restoredApiCount++;
+
+                            }
+
+                        } catch (err) {}
+
+                        try {
+
+                            if (
+                                !looksNative(
+                                    window.Document.prototype
+                                        .execCommand
+                                ) &&
+                                looksNative(native.execCommand)
+                            ) {
+
+                                Object.defineProperty(
+                                    window.Document.prototype,
+                                    'execCommand',
+                                    {
+                                        configurable: true,
+                                        writable: true,
+                                        value: native.execCommand
+                                    }
+                                );
+
+                                restoredApiCount++;
+
+                            }
+
+                        } catch (err) {}
+                    }
+
+
+                    /*
+                     * 清理全屏透明遮罩。
+                     *
+                     * 只处理「覆盖大半视口 + 透明 + 无文本 +
+                     * 无交互元素」的层，避免误伤正常弹窗。
+                     */
+
+                    let maskKilled = 0;
+
+                    function killMasks() {
+
+                        try {
+
+                            const vw =
+                                window.innerWidth || 1280;
+
+                            const vh =
+                                window.innerHeight || 800;
+
+                            const total = vw * vh;
+
+                            const nodes =
+                                document.querySelectorAll(
+                                    'div,section,aside,span,iframe,canvas'
+                                );
+
+                            for (
+                                let i = 0;
+                                i < nodes.length;
+                                i++
+                            ) {
+
+                                const el = nodes[i];
+
+                                if (
+                                    el.id ===
+                                        '__cx_paste_debug_panel__' ||
+                                    el.hasAttribute('data-cx-mask')
+                                ) {
+                                    continue;
+                                }
+
+                                const cs =
+                                    window.getComputedStyle(el);
+
+                                if (!cs) {
+                                    continue;
+                                }
+
+                                if (
+                                    cs.position !== 'fixed' &&
+                                    cs.position !== 'absolute'
+                                ) {
+                                    continue;
+                                }
+
+                                if (
+                                    cs.display === 'none' ||
+                                    cs.visibility === 'hidden'
+                                ) {
+                                    continue;
+                                }
+
+                                const zi = parseInt(cs.zIndex, 10);
+
+                                if (!isNaN(zi) && zi < 1) {
+                                    continue;
+                                }
+
+                                const r = el.getBoundingClientRect();
+
+                                if (
+                                    r.width * r.height <
+                                    total * 0.4
+                                ) {
+                                    continue;
+                                }
+
+                                if (
+                                    (el.textContent || '')
+                                        .trim().length > 12
+                                ) {
+                                    continue;
+                                }
+
+                                if (
+                                    el.querySelector(
+                                        'img,video,object,embed,' +
+                                        'input,textarea,button,a'
+                                    )
+                                ) {
+                                    continue;
+                                }
+
+                                const bg = cs.backgroundColor;
+
+                                const transparent =
+                                    bg === 'transparent' ||
+                                    /rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*0\s*\)/
+                                        .test(bg);
+
+                                if (!transparent) {
+                                    continue;
+                                }
+
+                                el.setAttribute('data-cx-mask', '1');
+
+                                el.style.setProperty(
+                                    'pointer-events',
+                                    'none',
+                                    'important'
+                                );
+
+                                maskKilled++;
+
+                            }
+
+                        } catch (err) {}
+                    }
+
+
+                    /*
+                     * 读写剪贴板与文本插入的底层工具。
+                     */
+
+                    function selectionText() {
+
+                        try {
+
+                            const sel =
+                                native.docGetSelection
+                                    ? native.docGetSelection
+                                        .call(document)
+                                    : window.getSelection();
+
+                            if (!sel || !sel.rangeCount) {
+                                return '';
+                            }
+
+                            try {
+
+                                return native
+                                    .selectionToString
+                                    .call(sel);
+
+                            } catch (err) {
+
+                                return String(sel);
+
+                            }
+
+                        } catch (err) {
+
+                            return '';
+
+                        }
+                    }
+
+
+                    function legacyCopy(text) {
+
+                        try {
+
+                            const ta =
+                                document.createElement(
+                                    'textarea'
+                                );
+
+                            ta.value = text;
+
+                            ta.setAttribute('data-cx-temp', '1');
+
+                            ta.style.cssText =
+                                'position:fixed;top:0;left:0;' +
+                                'width:1px;height:1px;opacity:0;' +
+                                'border:0;padding:0;z-index:-1';
+
+                            (document.body ||
+                                document.documentElement)
+                                .appendChild(ta);
+
+                            ta.select();
+
+                            ta.setSelectionRange(0, text.length);
+
+                            try {
+
+                                native.execCommand
+                                    .call(document, 'copy');
+
+                            } catch (err) {}
+
+                            ta.remove();
+
+                        } catch (err) {}
+                    }
+
+
+                    function writeClipboard(text) {
+
+                        if (!text) {
+                            return;
+                        }
+
+                        try {
+
+                            if (
+                                navigator.clipboard &&
+                                navigator.clipboard.writeText
+                            ) {
+
+                                navigator.clipboard
+                                    .writeText(text)
+                                    .catch(() => legacyCopy(text));
+
+                                return;
+
+                            }
+
+                        } catch (err) {}
+
+                        legacyCopy(text);
+                    }
+
+
+                    function insertText(el, text) {
+
+                        try {
+
+                            if (el.isContentEditable) {
+
+                                el.focus();
+
+                                const sel =
+                                    native.docGetSelection
+                                        .call(document);
+
+                                if (sel && sel.rangeCount) {
+
+                                    const range =
+                                        sel.getRangeAt(0);
+
+                                    range.deleteContents();
+
+                                    const node =
+                                        document.createTextNode(
+                                            text
+                                        );
+
+                                    range.insertNode(node);
+
+                                    range.setStartAfter(node);
+
+                                    range.collapse(true);
+
+                                    sel.removeAllRanges();
+
+                                    sel.addRange(range);
+
+                                } else {
+
+                                    el.textContent += text;
+
+                                }
+
+                                el.dispatchEvent(
+                                    new Event('input', {
+                                        bubbles: true
+                                    })
+                                );
+
+                                return;
+
+                            }
+
+                            const start =
+                                el.selectionStart == null
+                                    ? el.value.length
+                                    : el.selectionStart;
+
+                            const end =
+                                el.selectionEnd == null
+                                    ? el.value.length
+                                    : el.selectionEnd;
+
+                            el.value =
+                                el.value.slice(0, start) +
+                                text +
+                                el.value.slice(end);
+
+                            el.selectionStart =
+                                el.selectionEnd =
+                                    start + text.length;
+
+                            el.dispatchEvent(
+                                new Event('input', {
+                                    bubbles: true
+                                })
+                            );
+
+                        } catch (err) {}
+                    }
+
+
+                    function isTextField(el) {
+
+                        if (!el) {
+                            return false;
+                        }
+
+                        return (
+                            el.tagName === 'TEXTAREA' ||
+                            (
+                                el.tagName === 'INPUT' &&
+                                !/^(checkbox|radio|file|button|submit)$/i
+                                    .test(el.type || '')
+                            ) ||
+                            !!el.isContentEditable
+                        );
+                    }
+
+
+                    /*
+                     * 接管 Ctrl+C / Ctrl+V / Ctrl+X。
+                     *
+                     * 页面常用 document.onkeydown = () => false
+                     * 来取消快捷键默认行为。这种取消发生在内核层，
+                     * 覆盖事件对象的 preventDefault 拦不住
+                     * （实测无效），只能抢先把按键截断后自己实现。
+                     *
+                     * 必须注册在 window 捕获阶段，
+                     * 才能早于页面的 document 捕获监听器。
+                     */
+
+                    function handleShortcut(e) {
+
+                        if (
+                            !(e.ctrlKey || e.metaKey) ||
+                            e.altKey
+                        ) {
+                            return;
+                        }
+
+                        const key =
+                            String(e.key).toLowerCase();
+
+                        if (
+                            key !== 'c' &&
+                            key !== 'v' &&
+                            key !== 'x'
+                        ) {
+                            return;
+                        }
+
+                        const target = e.target;
+
+                        if (key === 'v') {
+
+                            if (!isTextField(target)) {
+                                return;
+                            }
+
+                            e.preventDefault();
+
+                            try {
+                                e.stopImmediatePropagation();
+                            } catch (err) {}
+
+                            try {
+                                e.stopPropagation();
+                            } catch (err) {}
+
+                            try {
+
+                                if (
+                                    navigator.clipboard &&
+                                    navigator.clipboard.readText
+                                ) {
+
+                                    navigator.clipboard
+                                        .readText()
+                                        .then(
+                                            text => {
+
+                                                if (text) {
+                                                    insertText(
+                                                        target,
+                                                        text
+                                                    );
+                                                }
+
+                                            }
+                                        )
+                                        .catch(() => {});
+
+                                }
+
+                            } catch (err) {}
+
+                            return;
+
+                        }
+
+                        e.preventDefault();
+
+                        try {
+                            e.stopImmediatePropagation();
+                        } catch (err) {}
+
+                        try {
+                            e.stopPropagation();
+                        } catch (err) {}
+
+                        const text = selectionText();
+
+                        if (!text || !text.trim()) {
+                            return;
+                        }
+
+                        writeClipboard(text);
+
+                        if (key === 'x' && !isTextField(target)) {
+
+                            try {
+
+                                const sel =
+                                    native.docGetSelection
+                                        .call(document);
+
+                                if (sel && sel.rangeCount) {
+
+                                    for (
+                                        let i = 0;
+                                        i < sel.rangeCount;
+                                        i++
+                                    ) {
+
+                                        sel.getRangeAt(i)
+                                            .deleteContents();
+
+                                    }
+
+                                }
+
+                            } catch (err) {}
+
+                        }
+                    }
+
+
+                    /*
+                     * 可打印字符兜底。
+                     *
+                     * 页面用 onkeydown 返回 false 时字符根本不会
+                     * 进入输入框。这里先让浏览器正常处理，
+                     * 一个 tick 后检查值没变就手动补写。
+                     * 不做无差别拦截，避免影响输入法组合。
+                     */
+
+                    function handlePrintableKey(e) {
+
+                        if (
+                            e.ctrlKey ||
+                            e.metaKey ||
+                            e.altKey ||
+                            e.isComposing
+                        ) {
+                            return;
+                        }
+
+                        if (
+                            e.key.length !== 1 ||
+                            e.key === 'Enter'
+                        ) {
+                            return;
+                        }
+
+                        const target = e.target;
+
+                        if (
+                            !target ||
+                            target.isContentEditable ||
+                            !isTextField(target)
+                        ) {
+                            return;
+                        }
+
+                        const key = e.key;
+
+                        const before = target.value;
+
+                        setTimeout(
+                            () => {
+
+                                try {
+
+                                    if (target.value !== before) {
+                                        return;
+                                    }
+
+                                    insertText(target, key);
+
+                                } catch (err) {}
+
+                            },
+                            0
+                        );
+                    }
+
+
+                    window.addEventListener(
+                        'keydown',
+                        handleShortcut,
+                        true
+                    );
+
+                    window.addEventListener(
+                        'keydown',
+                        handlePrintableKey,
+                        true
+                    );
+
+
+                    injectSelectStyle();
+                    restoreSelectionApi();
+                    killMasks();
+
+
+                    /*
+                     * 持续复查：页面可能在初始化完成后再覆盖
+                     * 选区 API 或重写 html 的 user-select。
+                     */
+
+                    setInterval(
+                        () => {
+
+                            restoreSelectionApi();
+
+                            injectSelectStyle();
+
+                        },
+                        500
+                    );
+
 
 
                     /*
@@ -566,11 +1487,29 @@
 
                     window.__CX_PASTE_DEBUG__ = {
 
-                        version: '4.0.0',
+                        version: '4.1.0',
 
                         events: EVENTS,
 
+                        guardedEvents: GUARDED_EVENTS,
+
+                        passiveEvents: PASSIVE_EVENTS,
+
                         counter: counter,
+
+                        restoredApiCount: () => restoredApiCount,
+
+                        maskKilled: () => maskKilled,
+
+                        sweep: () => {
+
+                            injectSelectStyle();
+
+                            restoreSelectionApi();
+
+                            killMasks();
+
+                        },
 
                         status: function () {
 
@@ -651,8 +1590,18 @@
 
             if (!root) {
 
+                /*
+                 * 早期注入时 documentElement 可能还没生成。
+                 * 直接放弃会让脚本永远不生效，这里延迟重试。
+                 */
+
                 error(
-                    '无法找到 script 注入位置'
+                    '无法找到 script 注入位置，100ms 后重试'
+                );
+
+                setTimeout(
+                    () => injectIntoMainWorld(targetDocument),
+                    100
                 );
 
                 return false;
